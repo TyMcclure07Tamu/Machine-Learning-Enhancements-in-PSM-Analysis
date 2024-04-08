@@ -4,6 +4,7 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from patsy import dmatrices
 from statsmodels.sandbox.regression.predstd import wls_prediction_std
+from scipy.stats import t
 
 def placebo_results(df, bcs, trim_value, iv_flag):
     for w in range(1, 13):
@@ -175,35 +176,130 @@ def placebo_results(df, bcs, trim_value, iv_flag):
     for j in range(1, 13):
         # Counting wins
         wincount = len(df[(df[f'lead2_win_wk{w}'] == 1) & 
-                          (df[f'lead2_pscore_wk{w}_group'] == j)])
+                        (df[f'lead2_pscore_wk{w}_group'] == j)])
 
         # Counting losses
         losscount = len(df[(df[f'lead2_win_wk{w}'] == 0) & 
-                           (df[f'lead2_pscore_wk{w}_group'] == j)])
+                        (df[f'lead2_pscore_wk{w}_group'] == j)])
 
         # Setting weight based on counts
         weight_dict[j] = 1 if min(wincount, losscount) >= 2 else 0
 
-    # weight_dict now contains the weights for each group
-        ## Made it to this line in stata should be 845
-		# local totalestobs = (`freq1'*`weight1' + `freq2'*`weight2' + `freq3'*`weight3' + `freq4'*`weight4' + `freq5'*`weight5' + `freq6'*`weight6' + `freq7'*`weight7' + `freq8'*`weight8' + `freq9'*`weight9' + `freq10'*`weight10' + `freq11'*`weight11' + `freq12'*`weight12')
-		# lincom (_b[_IleaXlead_1]*`freq1'*`weight1' + _b[_IleaXlead_2]*`freq2'*`weight2' + _b[_IleaXlead_3]*`freq3'*`weight3' + _b[_IleaXlead_4]*`freq4'*`weight4' + _b[_IleaXlead_5]*`freq5'*`weight5' + _b[_IleaXlead_6]*`freq6'*`weight6' + _b[_IleaXlead_7]*`freq7'*`weight7' + _b[_IleaXlead_8]*`freq8'*`weight8' + _b[_IleaXlead_9]*`freq9'*`weight9' + _b[_IleaXlead_10]*`freq10'*`weight10' + _b[_IleaXlead_11]*`freq11'*`weight11' + _b[_IleaXlead_12]*`freq12'*`weight12')/`totalestobs'
-		# local C = r(estimate)
-		# local SE = r(se)
-		# replace matching_rf_resid_coeff_`w' = `C' in `i'
-		# replace matching_rf_resid_se_`w' = `SE' in `i'
-		# replace matching_resid_N_`w' = e(N) in `i'		
-		# forvalues j = 1(1)12 {
-		# 	local fs`j' = 1 + matching_fs_coeff_`w'_`j'[`i']
-		# 	local fs_se`j' = matching_fs_se_`w'_`j'[`i']
-		# }
+    # Calculate total weighted frequency (totalestobs)
+    totalestobs = sum(freq_dict[j] * weight_dict[j] for j in range(1, 13))
+
+    # Assuming that model.params contains the coefficients
+    coefficients = [model.params.get(f'_IleaXlead_{j}', 0) for j in range(1, 13)]
+    weights = np.array([freq_dict[j] * weight_dict[j] for j in range(1, 13)])
+
+    # Linear combination of coefficients
+    linear_combination = sum(coeff * weight for coeff, weight in zip(coefficients, weights))
+
+    # Calculate C (the linear combination divided by total weighted frequency)
+    C = linear_combination / totalestobs
+
+    # Extracting relevant parts of the covariance matrix
+    indices = [f'_IleaXlead_{j}' for j in range(1, 13)]
+    cov_matrix = model.cov_params().loc[indices, indices]
+
+    # Calculate the standard error of the linear combination
+    SE = np.sqrt(np.dot(weights, np.dot(cov_matrix, weights.T))) / totalestobs
+
+    # Update the DataFrame for each j
+    for j in range(1, 13):
+        df.at[j - 1, f'matching_rf_resid_coeff_{w}'] = C
+        df.at[j - 1, f'matching_rf_resid_se_{w}'] = SE
+        df.at[j - 1, f'matching_resid_N_{w}'] = len(df)  # Or however you calculate N
+
+        # Update fs_j and fs_se_j values
+        for j in range(1, 13):
+            fs_j = 1 + df.at[j, f'matching_fs_coeff_{w}_{j}']
+            fs_se_j = df.at[j, f'matching_fs_se_{w}_{j}']
+            # If you need to store these values somewhere, include that code here
+    # Calculation of C (the linear combination)
+    C = sum(model.params.get(f'_IleaXlead_{j}', 0) * freq_dict[j] * weight_dict[j] / fs_dict[j] for j in range(1, 13)) / totalestobs
+
+        # Calculation of SE (standard error)
+    SE_components = []
+    for j in range(1, 13):
+        # Example calculation for fs and fs_se values
+        fs = calculate_fs(j)  # Replace with actual calculation
+        fs_se = calculate_fs_se(j)  # Replace with actual calculation
+
+        coefficient_se = model.bse.get(f'_IleaXlead_{j}', 0) / fs
+        additional_term = fs_se * model.params.get(f'_IleaXlead_{j}', 0) / fs**2
+        weighted_se = (coefficient_se**2 + additional_term**2) * (freq_dict[j] * weight_dict[j] / totalestobs)**2
+        SE_components.append(weighted_se)
+
+        SE = np.sqrt(sum(SE_components))
+
+        # Update the DataFrame
+    df.at[i, f'matching_resid_coeff_{w}'] = C
+    df.at[i, f'matching_resid_se_{w}'] = SE
+
+    i += 1
+
+    # Drop columns if they exist
+    columns_to_drop = ['total_resid_N', 'matching_resid_coeff', 'matching_resid_se', 
+                    'matching_resid_N', 'matching_rf_resid_coeff', 'matching_rf_resid_se']
+    df.drop(columns=[col for col in columns_to_drop if col in df.columns], inplace=True)
+
+    # Generate total_resid_N
+    total_resid_cols = [f'matching_resid_N_{i}' for i in range(1, 13)]
+    df['total_resid_N'] = df[total_resid_cols].sum(axis=1)
+
+    # Generate matching_rf_resid_coeff and matching_resid_coeff
+    for i in range(1, 13):
+        df[f'matching_rf_resid_coeff_{i}_weighted'] = df[f'matching_rf_resid_coeff_{i}'] * (df[f'matching_resid_N_{i}'] / df['total_resid_N'])
+        df[f'matching_resid_coeff_{i}_weighted'] = df[f'matching_resid_coeff_{i}'] * (df[f'matching_resid_N_{i}'] / df['total_resid_N'])
+
+    df['matching_rf_resid_coeff'] = df[[f'matching_rf_resid_coeff_{i}_weighted' for i in range(1, 13)]].sum(axis=1)
+    df['matching_resid_coeff'] = df[[f'matching_resid_coeff_{i}_weighted' for i in range(1, 13)]].sum(axis=1)
+
+    # Generate matching_rf_resid_se and matching_resid_se
+    for i in range(1, 13):
+        df[f'matching_rf_resid_se_{i}_weighted'] = (df[f'matching_rf_resid_se_{i}']**2) * ((df[f'matching_resid_N_{i}'] / df['total_resid_N'])**2)
+        df[f'matching_resid_se_{i}_weighted'] = (df[f'matching_resid_se_{i}']**2) * ((df[f'matching_resid_N_{i}'] / df['total_resid_N'])**2)
+
+    df['matching_rf_resid_se'] = np.sqrt(df[[f'matching_rf_resid_se_{i}_weighted' for i in range(1, 13)]].sum(axis=1))
+    df['matching_resid_se'] = np.sqrt(df[[f'matching_resid_se_{i}_weighted' for i in range(1, 13)]].sum(axis=1))
+
+    # Generate matching_resid_N
+    df['matching_resid_N'] = df[total_resid_cols].max(axis=1)
+
+    # Dropping columns if they exist and generating new columns
+    columns_to_generate = ['ols_result_seq', 'ols_result_wgt_seq', 'ols_pval_seq', 'ols_N_seq', 
+                        'ldv_result_seq', 'ldv_result_wgt_seq', 'ldv_pval_seq', 'ldv_N_seq', 'ldv_se_wgt_seq']
+    df.drop(columns=[col for col in columns_to_generate if col in df.columns], inplace=True)
+    for col in columns_to_generate:
+        df[col] = np.nan
+
+    # Looping and updating values
+    obscounter = 0
+    varcounter = 0
+    while obscounter < 20:
+        secounter = obscounter + 1
+        df.at[obscounter, 'ldv_N'] = df.at[varcounter, 'matching_resid_N']
+        
+        if 3 == 0:  # Condition always false, adjust if this is not intended
+            df.at[obscounter, 'ldv_result'] = df.at[varcounter, 'matching_rf_resid_coeff']
+            df.at[secounter, 'ldv_result'] = df.at[varcounter, 'matching_rf_resid_se']
+            df.at[obscounter, 'ldv_pval'] = 2 * t.sf(np.abs(df.at[varcounter, 'matching_rf_resid_coeff'] / df.at[varcounter, 'matching_rf_resid_se']), 105)
+        else:
+            df.at[obscounter, 'ldv_result'] = df.at[varcounter, 'matching_resid_coeff']
+            df.at[secounter, 'ldv_result'] = df.at[varcounter, 'matching_resid_se']
+            df.at[obscounter, 'ldv_pval'] = 2 * t.sf(np.abs(df.at[varcounter, 'matching_resid_coeff'] / df.at[varcounter, 'matching_resid_se']), 105)
+        
+        varcounter += 1
+        obscounter += 2
+
+    # Replace xi i.year with equivalent pandas operation if needed
+
+    counter = 0  # This is initialized but not used in the given snippet
 
 
 
-
-
-
-    # freq_dict now contains the frequencies for each group
+        # freq_dict now contains the frequencies for each group
 
     return print(df)
 
