@@ -1,8 +1,9 @@
 import pandas as pd
+import statsmodels.api as sm
 
 # Assuming df is your DataFrame and it's already loaded with your data
-# Replace 'your_dataframe.csv' with the path to your actual data file
-df = pd.read_csv('your_dataframe.csv')
+# Replace 'Formatted_data.csv' with the path to your actual data file
+df = pd.read_csv('Formatted_data.csv')
 
 # Sorting the DataFrame by 'teamname' and 'year'
 df_sorted = df.sort_values(by=['teamname', 'year'])
@@ -58,7 +59,7 @@ df.sort_values(by=['school_id', 'year'], inplace=True)
 # Example: Running a random effects model using MixedLM in statsmodels
 # Here, we assume 'outcome_variable' is your dependent variable and 'independent_variable' is your independent variable
 # You should replace these with your actual variable names
-md = MixedLM.from_formula("outcome_variable ~ independent_variable", groups=df["school_id"], data=df)
+md = sm.MixedLM.from_formula("outcome_variable ~ independent_variable", groups=df["school_id"], data=df)
 mdf = md.fit()
 print(mdf.summary())
 
