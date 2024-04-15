@@ -1,0 +1,230 @@
+# Resetting or dropping existing variables (if they exist)
+try:
+    del variable_name, ols_result, ols_pval, ols_N, ldv_result, ldv_pval, ldv_N
+except NameError:
+    pass  # Variables don't exist, so they can't be deleted
+
+# Initializing new variables
+variable_name = ""
+ols_result = None
+ols_pval = None
+ols_N = None
+ldv_result = None
+ldv_pval = None
+ldv_N = None
+import pandas as pd
+import statsmodels.api as sm
+import numpy as np
+
+# Assuming you have a DataFrame df similar to your Stata data
+# Drop existing variable if it exists
+df.drop('matching_dep_var', axis=1, errors='ignore', inplace=True)
+
+# Initialize the variable
+df['matching_dep_var'] = ""
+
+# Loop from 1 to 12
+for w in range(1, 13):
+    # Your xi and reg commands here would be replaced by pandas operations
+    # and statsmodels regressions. This part is highly dependent on your data structure.
+    
+    # Example of a regression model in statsmodels:
+    # X = df[['independent_variable1', 'independent_variable2']]
+    # Y = df['dependent_variable']
+    # X = sm.add_constant(X)  # Adds a constant term to the predictor
+    # model = sm.OLS(Y, X)
+    # results = model.fit()
+
+    # Your operations involving tab, local, and forvalues loops would
+    # also need to be adapted to Python, likely using pandas and numpy functions.
+
+    # Replace and generate commands would be handled using DataFrame manipulation.
+    # Example:
+    # df['new_column'] = df.apply(lambda row: some_function(row), axis=1)
+
+# Much of the specific functionality will need to be built using pandas and numpy,
+# as the direct commands from Stata do not have direct equivalents in Python.
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import numpy as np
+
+# Assuming you have a DataFrame named df
+
+for w in range(1, 13):
+    # Drop existing columns if they exist
+    columns_to_drop = [f"matching_coeff_{w}", f"matching_se_{w}", 
+                       f"matching_rf_coeff_{w}", f"matching_rf_se_{w}", 
+                       f"matching_N_{w}"]
+    df.drop(columns=columns_to_drop, axis=1, errors='ignore', inplace=True)
+
+    # Initialize new columns
+    for col in columns_to_drop:
+        df[col] = np.nan  # Use np.nan for missing values
+
+    # Your xi command here would be replaced by pandas operations
+    # Since xi command is specific to Stata, you'd need to create dummy variables or interactions manually
+
+    varnames = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 
+                'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 
+                'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 
+                'sat_25']
+    i = 0
+    for varname in varnames:
+        # Regression and other calculations here
+        # Example regression:
+        # result = smf.ols(f"{varname} ~ independent_variables", data=df).fit()
+        # df.loc[i, f"matching_coeff_{w}"] = result.params['parameter_of_interest']
+        # df.loc[i, f"matching_se_{w}"] = result.bse['parameter_of_interest']
+
+        # Note: In Python, you'll need to compute sums, conditions, and weights using pandas functions
+        # instead of the Stata commands.
+
+        i += 1
+import pandas as pd
+
+# Assuming your DataFrame is named 'df' and it has the required columns
+
+# Drop columns if they exist
+columns_to_drop = ['total_N', 'matching_coeff', 'matching_se', 
+                   'matching_rf_coeff', 'matching_rf_se', 'matching_N']
+df.drop(columns=columns_to_drop, axis=1, errors='ignore', inplace=True)
+
+# Generate 'total_N'
+matching_N_columns = [f'matching_N_{i}' for i in range(1, 13)]
+df['total_N'] = df[matching_N_columns].sum(axis=1)
+
+# Generate 'matching_rf_coeff'
+matching_rf_coeff_columns = [f'matching_rf_coeff_{i}' for i in range(1, 13)]
+df['matching_rf_coeff'] = sum(df[col] * (df[f'matching_N_{i}'] / df['total_N']) 
+                               for i, col in enumerate(matching_rf_coeff_columns, start=1))
+
+# Generate 'matching_rf_se'
+matching_rf_se_columns = [f'matching_rf_se_{i}' for i in range(1, 13)]
+df['matching_rf_se'] = (sum((df[col] ** 2) * ((df[f'matching_N_{i}'] / df['total_N']) ** 2) 
+                            for i, col in enumerate(matching_rf_se_columns, start=1))) ** 0.5
+
+# Generate 'matching_coeff'
+matching_coeff_columns = [f'matching_coeff_{i}' for i in range(1, 13)]
+df['matching_coeff'] = sum(df[col] * (df[f'matching_N_{i}'] / df['total_N']) 
+                            for i, col in enumerate(matching_coeff_columns, start=1))
+
+# Generate 'matching_se'
+matching_se_columns = [f'matching_se_{i}' for i in range(1, 13)]
+df['matching_se'] = (sum((df[col] ** 2) * ((df[f'matching_N_{i}'] / df['total_N']) ** 2) 
+                         for i, col in enumerate(matching_se_columns, start=1))) ** 0.5
+
+# Generate 'matching_N'
+df['matching_N'] = df[matching_N_columns].max(axis=1)
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from scipy.stats import t
+
+# Assuming you have a DataFrame 'df' with appropriate data structure
+# Initialize your variables
+obscounter = 1
+varcounter = 1
+
+# Example loop for updating variables
+while obscounter <= 20:
+    secounter = obscounter + 1
+    df.loc[obscounter, 'variable_name'] = df.loc[varcounter, 'matching_dep_var']
+    # ... other operations ...
+
+    varcounter += 1
+    obscounter += 2
+
+# Example for regression and prediction
+# for varname in varlist:
+#     result = smf.ols(f"r{varname}_temp ~ independent_variables", data=df).fit()
+#     df[f"r{varname}"] = result.resid
+#     # ... other operations ...
+
+# Loop with complex data manipulation
+for w in range(1, 13):
+    # ... your data manipulations ...
+    for varname in ['alumni_ops_athletics', 'alum_non_athl_ops', ...]: # complete this list
+        # Update 'matching_resid_dep_var'
+        df.loc[i, 'matching_resid_dep_var'] = varname
+
+        # Perform regression and other calculations
+        # Example regression:
+        # result = smf.ols(f"r{varname} ~ independent_variables", data=df).fit()
+        
+        # Calculations like the `tab` command in Stata might involve grouping and aggregation in pandas
+        # The `forvalues` loop might be replaced with pandas groupby or conditional indexing
+
+# Remember, direct equivalents for Stata commands like `xi`, `svmat`, `capture`, etc., do not exist in Python.
+# You would need to adapt these to pandas or numpy functions.
+import pandas as pd
+import numpy as np
+
+# Assuming you have a pandas DataFrame called 'df' which has similar structure to your Stata dataset
+# Example DataFrame initialization (you will need to adjust this to match your actual data)
+# df = pd.DataFrame({
+#     'matching_resid_N_1': [...],
+#     'matching_resid_N_2': [...],
+#     ... (and so on for all required columns)
+# })
+
+# Initialize new columns
+df['total_resid_N'] = df[[f'matching_resid_N_{i}' for i in range(1, 13)]].sum(axis=1)
+
+for i in range(1, 13):
+    df[f'matching_rf_resid_coeff_{i}'] *= df[f'matching_resid_N_{i}'] / df['total_resid_N']
+    df[f'matching_rf_resid_se_{i}'] = (df[f'matching_rf_resid_se_{i}'] ** 2) * (df[f'matching_resid_N_{i}'] / df['total_resid_N']) ** 2
+
+df['matching_rf_resid_coeff'] = df[[f'matching_rf_resid_coeff_{i}' for i in range(1, 13)]].sum(axis=1)
+df['matching_rf_resid_se'] = np.sqrt(df[[f'matching_rf_resid_se_{i}' for i in range(1, 13)]].sum(axis=1))
+
+# Same logic for matching_resid_coeff and matching_resid_se
+for i in range(1, 13):
+    df[f'matching_resid_coeff_{i}'] *= df[f'matching_resid_N_{i}'] / df['total_resid_N']
+    df[f'matching_resid_se_{i}'] = (df[f'matching_resid_se_{i}'] ** 2) * (df[f'matching_resid_N_{i}'] / df['total_resid_N']) ** 2
+
+df['matching_resid_coeff'] = df[[f'matching_resid_coeff_{i}' for i in range(1, 13)]].sum(axis=1)
+df['matching_resid_se'] = np.sqrt(df[[f'matching_resid_se_{i}' for i in range(1, 13)]].sum(axis=1))
+
+# Find the max value for 'matching_resid_N'
+df['matching_resid_N'] = df[[f'matching_resid_N_{i}' for i in range(1, 13)]].max(axis=1)
+
+# Loop for updating specific values
+obscounter = 1
+varcounter = 1
+while obscounter <= 20:
+    secounter = obscounter + 1
+    df.at[obscounter, 'ldv_N'] = df.at[varcounter, f'matching_resid_N_{varcounter}']
+    # Update other columns as needed, similar to above line
+    varcounter += 1
+    obscounter += 2
+import pandas as pd
+from scipy.stats import t
+
+# Assuming df is your pandas DataFrame and it has columns named matching_resid_coeff_*, matching_resid_se_*, etc.
+# Initialize variables for the loop
+obscounter = 1
+varcounter = 1
+
+# Loop to update values
+while obscounter <= 20:
+    secounter = obscounter + 1
+
+    # For RF result (uncomment the following lines for IV result and comment these out)
+    df.at[obscounter, 'ldv_result'] = df.at[varcounter, f'matching_resid_coeff_{varcounter}']
+    df.at[secounter, 'ldv_result'] = df.at[varcounter, f'matching_resid_se_{varcounter}']
+    df.at[obscounter, 'ldv_pval'] = 2 * t.sf(abs(df.at[varcounter, f'matching_resid_coeff_{varcounter}'] / df.at[varcounter, f'matching_resid_se_{varcounter}']), 105)
+
+    # Uncomment and adapt these lines for IV result
+    # df.at[obscounter, 'ldv_result'] = df.at[varcounter, f'matching_rf_resid_coeff_{varcounter}']
+    # df.at[secounter, 'ldv_result'] = df.at[varcounter, f'matching_rf_resid_se_{varcounter}']
+    # df.at[obscounter, 'ldv_pval'] = 2 * t.sf(abs(df.at[varcounter, f'matching_rf_resid_coeff_{varcounter}'] / df.at[varcounter, f'matching_rf_resid_se_{varcounter}']), 105)
+
+    varcounter += 1
+    obscounter += 2
+
+# Dropping columns starting with '_I'
+df.drop(df.filter(regex='_I.*').columns, axis=1, inplace=True)
+
+# You can now view your DataFrame with the specified columns
+print(df[['variable_name', 'ldv_result', 'ldv_pval', 'ldv_N']])
