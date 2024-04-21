@@ -6,10 +6,25 @@ import seaborn as sns
 import statsmodels.formula.api as smf
 from patsy import dmatrices
 from scipy.stats import t
+from linearmodels import OLS
+from linearmodels.iv import IV2SLS
+import warnings
 
+# Suppress only PerformanceWarnings from pandas
+warnings.filterwarnings(action='ignore', category=UserWarning, message='.*DataFrame is highly fragmented.*')
+pd.options.mode.chained_assignment = None
 
+# Load the CSV file into a DataFrame
+df = pd.read_csv('Formatted_data.csv')
 
-    ##Moving to the Method call out that this function makes starts at 252 in stata
+# Define the lag variables you want to check
+# Assuming the names are like 'lag_seasonwins1', 'lag_seasonwins2', etc.
+lag_variables = ['lag_seasonwins1', 'lag_seasonwins2', 'lag_seasonwins3', 'lag_seasonwins4']
+
+# Check if these lag variables are in the DataFrame and then select them
+lag_variables_present = [var for var in lag_variables if var in df.columns]
+selected_data = df[lag_variables_present]
+##Moving to the Method call out that this function makes starts at 252 in stata
 
 
 def main_results(df, bcs, trim_value, iv_flag, cluster_school):
@@ -26,6 +41,16 @@ def main_results(df, bcs, trim_value, iv_flag, cluster_school):
     Returns:
     pd.DataFrame: DataFrame with new group assignments.
     """
+
+        # Recreate the combined grouping variable after handling NaNs
+    df['school_year_group'] = df['school_id'].astype(str) + '_' + df['year'].astype(str)
+
+    # Filter the DataFrame just before fitting the model to ensure all data is aligned
+    filtered_df = df.query('lag_ipw_weight < @trim_value and seasonwins != "."')
+
+    # Verify the alignment
+    print("Filtered DataFrame length:", len(filtered_df))
+    print("Unique groups count in filtered data:", filtered_df['school_year_group'].nunique())
 
     # Apply the BCS condition
     df = df.query('bcs == 1')
@@ -67,524 +92,673 @@ def main_results(df, bcs, trim_value, iv_flag, cluster_school):
         df['ldv_pval'] = np.nan
         df['ldv_N'] = np.nan
 
-        # Now 'df' has the required columns reset
-        # Drop the variable if it exists and then add it back
-    if 'matching_dep_var' in df.columns:
-        df.drop(columns=['matching_dep_var'], inplace=True)
-    df['matching_dep_var'] = ''
+ #RUN FIRST STAGE FOR MATCHING REGRESSIONS line 293
 
-    # Run first stage for matching regressions
+    # Check for null values in the school_id column
+    if df['school_id'].isnull().any():
+        print("Null values found in 'school_id', which may cause issues with clustering.")
+        df['school_id'].fillna(method='ffill', inplace=True)  # You can choose an appropriate method to handle missing values
+
+    # Ensure 'school_id' is an integer or categorical as expected by statsmodels
+    df['school_id'] = df['school_id'].astype(int)
+
+    # Check the alignment of data
+    print("Data length:", len(df))
+    print("Length of school_id for clustering:", df['school_id'].dropna().shape[0])
+
+   # First, ensure 'school_id' and 'year' are available and then create 'school_year_group'
+    if 'school_id' in df.columns and 'year' in df.columns:
+        df['school_year_group'] = df['school_id'].astype(str) + '_' + df['year'].astype(str)
+    else:
+        raise ValueError("Missing 'school_id' or 'year' columns required to create the 'school_year_group'.")
+
+    # Filter the DataFrame to remove any rows where key variables might be NaN before running regressions
+    df = df.dropna(subset=['lag_ipw_weight', 'seasonwins', 'school_year_group'] + [f'lag_win_wk{w}' for w in range(1, 13)] + [f'lag_pscore_wk{w}' for w in range(1, 13)])
+
     for w in range(1, 13):
-        # Generate dummies and interaction terms
-        dummies = pd.get_dummies(df[f'lag_pscore_wk{w}_group'], prefix=f'lag_pscore_wk{w}_group')
-        interaction1 = dummies.mul(df[f'lag_win_wk{w}'], axis=0)
-        interaction2 = dummies.mul(df[f'lag_pscore_wk{w}'], axis=0)
-        df = pd.concat([df, interaction1, interaction2], axis=1)
+        # Creating interaction terms for the regression
+        df[f'lag_win_pscore_interaction_wk{w}'] = df[f'lag_pscore_wk{w}_group'] * df[f'lag_win_wk{w}']
+        df[f'lag_pscore_interaction_wk{w}'] = df[f'lag_pscore_wk{w}_group'] * df[f'lag_pscore_wk{w}']
 
-        # Regression
-        y, X = dmatrices(f'lag_exp_wins_wk{w} ~ 0 + _Ilag*', data=df, return_type='dataframe')
-        model = sm.OLS(y, X)
-        results = model.fit(cov_type='cluster', cov_kwds={'groups': df['school_id']})
+        # Define the regression formula
+        formula = f'lag_exp_wins_wk{w} ~ lag_win_pscore_interaction_wk{w} + lag_pscore_interaction_wk{w}'
 
-        # Frequency and value matrices
-        freq_val = df[f'lag_pscore_wk{w}_group'][results.model.data.row_labels].value_counts().reset_index()
-        freq_val.columns = ['val', 'freq']
+        # Prepare the data for regression
+        y, X = dmatrices(formula, data=df, return_type='dataframe')
+
+        # Fit the model with clustered standard errors using 'school_year_group'
+        try:
+            model = sm.OLS(y, X)
+            results = model.fit(cov_type='cluster', cov_kwds={'groups': df['school_id']})
+            print(results.summary())
+
+            # Store coefficients and standard errors into the DataFrame
+            for i, param in enumerate(results.params.index):
+                df[f'coeff_{w}_{param}'] = results.params[param]
+                df[f'se_{w}_{param}'] = results.bse[param]
+                df[f'matching_rf_coeff_{w}'] = results.params[f'lag_win_pscore_interaction_wk{w}']
+                df[f'matching_rf_se_{w}'] = results.bse[f'lag_win_pscore_interaction_wk{w}']
+                df['matching_dep_var'] = ''
+
+
+        except Exception as e:
+            print(f"Error in fitting the model for week {w}: {e}")
+            continue
         
-        # Ensure all groups are represented
-        for j in range(1, 13):
-            if j not in freq_val['val']:
-                freq_val = freq_val.append({'val': j, 'freq': 0}, ignore_index=True)
+        # Tabulate and calculate frequencies within the effective sample
+        freq_results = df.loc[results.model.data.row_labels, f'lag_pscore_wk{w}_group'].value_counts().rename_axis('val').reset_index(name='freq')
+
+        # Store total number of observations
+        totalestobs = len(results.model.data.row_labels)
         
-        freq_val.sort_values(by='val', inplace=True)
-        # Additional operations can be performed on freq_val as needed
+        # Ensure all groups from 1 to 12 are represented, filling missing with zero
+        all_groups = pd.DataFrame({'val': range(1, 13)})
+        freq_results = all_groups.merge(freq_results, on='val', how='left').fillna({'freq': 0})
+        
+        # Print or use `freq_results` as needed
+        print(f'Week {w} frequency results:\n', freq_results)
 
     # Note: Some aspects like 'noconstant' in regression are handled differently in statsmodels
     # and might need adjustment based on the specifics of your analysis.
+    
 
     # Run the process for each week
     for w in range(1, 13):
-        # Drop if exists and generate new variables
-        for j in range(1, 13):
-            df.drop(columns=[f'matching_fs_coeff_{w}_{j}', f'matching_fs_se_{w}_{j}'], errors='ignore', inplace=True)
+        # Check if the regression-related columns exist
+        if f'coeff_{w}_lag_win_pscore_interaction_wk{w}' in df.columns and f'coeff_{w}_lag_pscore_interaction_wk{w}' in df.columns:
+            print(f"Using existing regression results for week {w}.")
 
-        # Create variables for regression
-        df[f'matching_fs_coeff_lhs_{w}'] = np.nan
-        df['group'] = np.arange(1, 13)
-        df['groupsq'] = df['group'] ** 2
-
-        # Extracting coefficients and assigning them to the created variable
-        for j in range(1, 13):
-            df.loc[j - 1, f'matching_fs_coeff_lhs_{w}'] = results.params.get(f'_IlagXlag__{j}', np.nan)
-
-        # Regression
-        formula = f'matching_fs_coeff_lhs_{w} ~ group + groupsq'
-        result = smf.ols(formula, data=df.loc[:11, :]).fit()
+            # Assign coefficients to new columns formatted for each group
+            for j in range(1, 13):  # Assuming groups 1 to 12 are meaningful indices
+                df[f'matching_fs_coeff_{w}_{j}'] = df[f'coeff_{w}_lag_win_pscore_interaction_wk{w}']
+                df[f'matching_fs_se_{w}_{j}'] = df[f'se_{w}_lag_win_pscore_interaction_wk{w}']
         
-        # Predictions
-        df[f'matching_fs_coeff_{w}_pred'], df[f'matching_fs_coeff_{w}_pred_se'] = result.predict(return_std=True)
+        else:
+            print(f"Regression columns for week {w} are missing.")
 
-        # Creating additional columns
-        for j in range(1, 13):
-            df[f'matching_fs_coeff_{w}_{j}'] = np.nan
-            df[f'matching_fs_se_{w}_{j}'] = np.nan
-
-        # Fill in the generated columns with predictions and standard errors
-        for j in range(1, 13):
-            df.loc[j - 1, f'matching_fs_coeff_{w}_{j}'] = df.loc[j - 1, f'matching_fs_coeff_{w}_pred']
-            df.loc[j - 1, f'matching_fs_se_{w}_{j}'] = df.loc[j - 1, f'matching_fs_coeff_{w}_pred_se']
-
-        # Clean up
-        df.drop(columns=['matching_fs_coeff_' + str(w) + '_pred', 'matching_fs_coeff_' + str(w) + '_pred_se', 'group', 'groupsq'], inplace=True)
-
-        # Special case for w==12
+        # Special case handling for the last week
         if w == 12:
-            df.loc[:29, [f'matching_fs_coeff_{w}_{j}' for j in range(1, 13)]] = 0
-            df.loc[:29, [f'matching_fs_se_{w}_{j}' for j in range(1, 13)]] = 0
+            for j in range(1, 13):
+                df[f'matching_fs_coeff_{w}_{j}'] = 0  # Zero out coefficients for the last week
+                df[f'matching_fs_se_{w}_{j}'] = 0     # Zero out standard errors for the last week
+    columns_to_drop = []
 
-    # Note: Adjust the index ranges (like :11 or :29) based on your DataFrame's structure
+    # Iterate through weeks to identify all regression-related columns
+    for w in range(1, 13):
+        # Adding interaction coefficient and standard error columns for each week to the drop list
+        columns_to_drop.extend([
+            f'coeff_{w}_lag_win_pscore_interaction_wk{w}',
+            f'se_{w}_lag_win_pscore_interaction_wk{w}',
+            f'coeff_{w}_lag_pscore_interaction_wk{w}',
+            f'se_{w}_lag_pscore_interaction_wk{w}',
+            f'lag_win_pscore_interaction_wk{w}',
+            f'lag_pscore_interaction_wk{w}',
+            f'coeff_{w}_Intercept',
+            f'se_{w}_Intercept'
+        ])
+
+    # Drop these columns from the DataFrame, checking first if they exist
+    df.drop(columns=[col for col in columns_to_drop if col in df.columns], inplace=True)
+
+    print("Dropped intermediate regression output columns.")
 
     # List of variables for the regression
     varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
 
-    # Run reduced form for matching regressions
+    # Assuming 'df' is your DataFrame loaded with appropriate data
+    cluster_var = 'school_id'
+    varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
+
     for w in range(1, 13):
-        # Drop and generate new variables
-        for var in ['matching_coeff', 'matching_se', 'matching_rf_coeff', 'matching_rf_se', 'matching_N']:
-            df.drop(columns=[f'{var}_{w}'], errors='ignore', inplace=True)
-            df[f'{var}_{w}'] = np.nan
+        for var_group in ['win', 'pscore']:
+            df[f'lag_{var_group}_pscore_interaction_wk{w}'] = df[f'lag_pscore_wk{w}_group'] * df[f'lag_{var_group}_wk{w}']
+        
+        interaction_terms = ' + '.join([f'lag_{var}_pscore_interaction_wk{w}' for var in ['win', 'pscore']])
+        formula = f'lag_exp_wins_wk{w} ~ 0 + {interaction_terms}'
+        df_filtered = df.dropna(subset=[f'lag_{var}_pscore_interaction_wk{w}' for var in ['win', 'pscore']])  # Drop NA to ensure valid regression input
 
-        # Generate dummies and interaction terms
-        dummies = pd.get_dummies(df[f'lag_pscore_wk{w}_group'], prefix=f'lag_pscore_wk{w}_group')
-        interaction1 = dummies.mul(df[f'lag_win_wk{w}'], axis=0)
-        interaction2 = dummies.mul(df[f'lag_pscore_wk{w}'], axis=0)
-        df = pd.concat([df, interaction1, interaction2], axis=1)
+        if not df_filtered.empty:
+            model = smf.ols(formula, data=df_filtered).fit()
+            print(model.summary())
+        else:
+            print(f"No valid data available for regression for week {w}")
 
-        i = 1
-        for varname in varlist:
-            # Running the regression
-            y, X = dmatrices(f'{varname} ~ 0 + _Ilag*', data=df, return_type='dataframe')
-            model = sm.OLS(y, X)
-            results = model.fit(cov_type='cluster', cov_kwds={'groups': df['school_id']})
+        # Optional cleanup and data saving logic here
 
-            # Storing regression results
-            df.at[i - 1, f'matching_coeff_{w}'] = results.params.values[0]  # Assuming the first coefficient is of interest
-            df.at[i - 1, f'matching_se_{w}'] = results.bse.values[0]        # Standard error of the first coefficient
-            df.at[i - 1, f'matching_N_{w}'] = results.nobs                 # Number of observations
+    for varname in varlist:
+        lag_columns = [col for col in df.columns if col.startswith('lag') and varname in col]
+        if not lag_columns:
+            print(f"No lag predictors found for {varname}. Skipping regression.")
+            continue
 
-            # Assuming 'weight_variable' is the column with weights
-            weight_variable = 'your_weight_column_name'
+        formula = f'{varname} ~ ' + ' + '.join(lag_columns)
+        if df[lag_columns].dropna().empty:
+            print(f"Not enough data to perform regression on {varname}")
+            continue
 
-            for w in range(1, 13):
-                # Assuming the group variable is something like 'lag_pscore_wkX_group'
-                group_var = f'lag_pscore_wk{w}_group'
-                
-                # Calculate frequency distribution
-                freq_distribution = df[group_var].value_counts()
-
-                # Apply weights: multiply frequencies by the weight of each group
-                # Assuming weights are in another column and need to be aggregated in some way
-                weighted_freq = freq_distribution.mul(df.groupby(group_var)[weight_variable].mean())
-
-                # Sum of weighted frequencies
-                total_weighted_freq = weighted_freq.sum()
-
-                # The variable 'total_weighted_freq' now holds the sum of weighted frequencies for week 'w'
-                # You can store or use this variable as needed in your analysis
-
-            i += 1
-
-        # Drop if exists and generate new variables
-        for j in range(1, 13):
-            df.drop(columns=[f'matching_fs_coeff_{w}_{j}', f'matching_fs_se_{w}_{j}'], errors='ignore', inplace=True)
-            df[f'matching_fs_coeff_{w}_{j}'] = np.nan
-            df[f'matching_fs_se_{w}_{j}'] = np.nan
-
-        # Create variables for regression
-        df[f'matching_fs_coeff_lhs_{w}'] = np.nan
-        df['group'] = np.arange(1, 13)
-        df['groupsq'] = df['group'] ** 2
-
-        # Regression
-        formula = f'matching_fs_coeff_lhs_{w} ~ group + groupsq'
-        result = smf.ols(formula, data=df.loc[:11, :]).fit()
-
-        # Predictions
-        df['matching_fs_coeff_pred'], df['matching_fs_coeff_pred_se'] = result.predict(df.loc[:11, ['group', 'groupsq']], return_std=True)
-
-        # Storing predictions and standard errors in the designated columns
-        for j in range(1, 13):
-            df.loc[j - 1, f'matching_fs_coeff_{w}_{j}'] = df.loc[j - 1, 'matching_fs_coeff_pred']
-            df.loc[j - 1, f'matching_fs_se_{w}_{j}'] = df.loc[j - 1, 'matching_fs_coeff_pred_se']
-
-        # Clean up
-        df.drop(columns=['matching_fs_coeff_pred', 'matching_fs_coeff_pred_se', 'group', 'groupsq'], inplace=True)
-
-        # Special case for w==12
-        if w == 12:
-            df.loc[:29, [f'matching_fs_coeff_{w}_{j}' for j in range(1, 13)]] = 0
-            df.loc[:29, [f'matching_fs_se_{w}_{j}' for j in range(1, 13)]] = 0
-
-    # Adjust index ranges (:11 or :29) based on your DataFrame's structure
+        # Use robust standard errors
+        model = smf.ols(formula, data=df).fit(cov_type='HC3')
+        print(model.summary())
 
     # Assuming 'df' is your pandas DataFrame
     varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
 
-    for w in range(1, 13):
-        # Drop and create new variables
-        for var in ['matching_coeff', 'matching_se', 'matching_rf_coeff', 'matching_rf_se', 'matching_N']:
+    for w in range(1, 13):  # Correct the range if you need it to go up to week 12
+    # Drop and create new variables
+        for var in ['matching_coeff', 'matching_se']:
             df.drop(columns=[f'{var}_{w}'], errors='ignore', inplace=True)
             df[f'{var}_{w}'] = np.nan
 
         # Create interaction terms
         for varname in varlist:
-            dummies = pd.get_dummies(df[f'lag_pscore_wk{w}_group'], prefix=f'lag_pscore_wk{w}_group')
-            interaction1 = dummies.mul(df[f'lag_win_wk{w}'], axis=0)
-            interaction2 = dummies.mul(df[f'lag_pscore_wk{w}'], axis=0)
-            df = pd.concat([df, interaction1, interaction2], axis=1)
+            lag_columns = [col for col in df.columns if col.startswith('lag') and varname in col]
+            if not lag_columns:
+                print(f"No lag predictors found for {varname}. Skipping regression.")
+                continue
 
-            # Run regression
-            y, X = dmatrices(f'{varname} ~ 0 + _Ilag*', data=df, return_type='dataframe')
-            model = sm.OLS(y, X)
-            results = model.fit(cov_type='cluster', cov_kwds={'groups': df['school_id']})
+            # Construct the formula for regression
+            formula = f'{varname} ~ ' + ' + '.join(lag_columns)
+           # Re-check the group variable just before fitting the model
+            df_filtered['school_year_group'] = df_filtered['school_id'].astype(str) + '_' + df_filtered['year'].astype(str)
+
+            # Confirm the size and count of unique groups match
+            print("Filtered DataFrame length after creating school_year_group:", len(df_filtered))
+            print("Unique groups count in filtered data after re-assigning school_year_group:", df_filtered['school_year_group'].nunique())
+
+            # Confirm no missing values in key columns
+            print("Missing values in 'school_year_group':", df_filtered['school_year_group'].isna().sum())
+            print("Missing values in 'lag_ipw_weight':", df_filtered['lag_ipw_weight'].isna().sum())
+            print("Missing values in 'seasonwins':", df_filtered['seasonwins'].isna().sum())
+            try:
+                formula = 'seasonwins ~ lag_ipw_weight + C(year)'
+                model = smf.ols(formula, data=df_filtered)
+                result = model.fit(cov_type='cluster', cov_kwds={'groups': df_filtered['school_year_group']})
+                print(result.summary())
+            except Exception as e:
+                print(f"Error during model fitting after alignment check: {e}")
 
             # Storing regression results
-            df.at[i - 1, f'matching_coeff_{w}'] = results.params.values[0]  # Assuming the first coefficient is of interest
-            df.at[i - 1, f'matching_se_{w}'] = results.bse.values[0]        # Standard error of the first coefficient
-            df.at[i - 1, f'matching_N_{w}'] = results.nobs                 # Number of observations
+            df.at[w - 1, f'matching_coeff_{w}'] = results.params.values[0]  # Assuming the first coefficient is of interest
+            df.at[w - 1, f'matching_se_{w}'] = results.bse.values[0]        # Standard error of the first coefficient
+            df.at[w - 1, f'matching_N_{w}'] = results.nobs                 # Number of observations
 
-            # Calculate frequencies
-            freq_dist = df[f'lag_pscore_wk{w}_group'][results.model.data.row_labels].value_counts()
-            for j in range(1, 13):
-                df.at[j - 1, f'freq_{w}_{j}'] = freq_dist.get(j, 0)
-
-            i += 1
+            # Handle potential absence of the column in DataFrame
+            if f'lag_pscore_wk{w}_group' in df.columns:
+                freq_dist = df[f'lag_pscore_wk{w}_group'][results.model.data.row_labels].value_counts()
+                for j in range(1, 12):
+                    df.at[j - 1, f'freq_{w}_{j}'] = freq_dist.get(j, 0)
 
     # Note: Adjust the index ranges and variable names to align with your specific dataset and requirements.
+    def calculate_weights_and_frequencies(df):
+        for w in range(1, 13):
+            df[f'weight_{w}'] = 1  # Assume all weights are 1 initially
+            for j in range(1, 13):
+                win_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 1)].shape[0]
+                loss_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 0)].shape[0]
+                if min(win_count, loss_count) < 2:
+                    df.loc[df[f'lag_pscore_wk{w}_group'] == j, f'weight_{w}'] = 0
 
-    for w in range(1, 13):
-        # Initialize a column to store weights for each group
-        df[f'weight_{w}'] = 1  # Assume all weights are 1 initially
+            # Calculating frequencies
+            group_col = f'lag_pscore_wk{w}_group'
+            df[f'freq_{w}'] = df.groupby(group_col)[group_col].transform('count')
+            df[f'weighted_freq_{w}'] = df[f'freq_{w}'] * df[f'weight_{w}']
 
-        # Iterate through each of the 12 groups
-        for j in range(1, 13):
-            # Calculate the count of wins and losses in each group
-            win_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 1)].shape[0]
-            loss_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 0)].shape[0]
-
-            # Enforce overlap condition
-            if min(win_count, loss_count) < 2:
-                df.loc[df[f'lag_pscore_wk{w}_group'] == j, f'weight_{w}'] = 0
-
-
-    for w in range(1, 13):
-        # Initialize variables to store the total coefficient and standard error
-        total_coeff = 0
-        total_se_sq = 0
-        total_weighted_freq = 0
-
-        for j in range(1, 13):
-            # Assume 'coeff_j' and 'se_j' are the regression coefficient and standard error for group j
-            coeff = df.loc[df[f'lag_pscore_wk{w}_group'] == j, 'coeff_j'].values[0]
-            se = df.loc[df[f'lag_pscore_wk{w}_group'] == j, 'se_j'].values[0]
-
-            # Frequency and weight for group j
-            freq = df.loc[df[f'lag_pscore_wk{w}_group'] == j, 'frequency'].values[0]
-            weight = df.loc[df[f'lag_pscore_wk{w}_group'] == j, 'weight'].values[0]
-
-            # Weighted coefficient and its variance
-            weighted_coeff = coeff * freq * weight
-            weighted_var = (se ** 2) * (freq ** 2) * (weight ** 2)
-
-            # Add to totals
-            total_coeff += weighted_coeff
-            total_se_sq += weighted_var
-            total_weighted_freq += freq * weight
-
-        # Final weighted average and standard error
-        weighted_avg_coeff = total_coeff / total_weighted_freq
-        weighted_avg_se = np.sqrt(total_se_sq) / total_weighted_freq
-
-        # Store these values in the DataFrame
-        df[f'matching_coeff_{w}'] = weighted_avg_coeff
-        df[f'matching_se_{w}'] = weighted_avg_se
-
-        # Increment to next set of groups
-
-        # Assuming 'df' is your pandas DataFrame
-    # Add up the total number of observations across all groups
-    df['total_N'] = df[[f'matching_N_{i}' for i in range(1, 13)]].sum(axis=1)
-
-    # Calculate weighted averages for coefficients and standard errors
-    df['matching_rf_coeff'] = sum(df[f'matching_rf_coeff_{i}'] * (df[f'matching_N_{i}'] / df['total_N']) for i in range(1, 13))
-    df['matching_rf_se'] = np.sqrt(sum((df[f'matching_rf_se_{i}'] ** 2) * ((df[f'matching_N_{i}'] / df['total_N']) ** 2) for i in range(1, 13)))
-
-    df['matching_coeff'] = sum(df[f'matching_coeff_{i}'] * (df[f'matching_N_{i}'] / df['total_N']) for i in range(1, 13))
-    df['matching_se'] = np.sqrt(sum((df[f'matching_se_{i}'] ** 2) * ((df[f'matching_N_{i}'] / df['total_N']) ** 2) for i in range(1, 13)))
-
-    # The maximum number of observations among all groups
-    df['matching_N'] = df[[f'matching_N_{i}' for i in range(1, 13)]].max(axis=1)
-
-    # Assuming 'df' is your pandas DataFrame
-    df['variable_name'] = pd.NA  # Initialize the column
-    df['ols_N'] = pd.NA
-    df['ols_result'] = pd.NA
-    df['ols_pval'] = pd.NA
-
-    obscounter = 0
-    varcounter = 0
-
-    while obscounter < 20:
-        secounter = obscounter + 1
-        
-        # Updating the DataFrame
-        df.at[obscounter, 'variable_name'] = df.at[varcounter, 'matching_dep_var']
-        df.at[obscounter, 'ols_N'] = df.at[varcounter, 'matching_N']
-        
-        if 3 == 0:  # Replace 3 with your actual condition
-            df.at[obscounter, 'ols_result'] = df.at[varcounter, 'matching_rf_coeff']
-            df.at[secounter, 'ols_result'] = df.at[varcounter, 'matching_rf_se']
-            df.at[obscounter, 'ols_pval'] = 2 * t.sf(abs(df.at[varcounter, 'matching_rf_coeff'] / df.at[varcounter, 'matching_rf_se']), 105)
-        else:
-            df.at[obscounter, 'ols_result'] = df.at[varcounter, 'matching_coeff']
-            df.at[secounter, 'ols_result'] = df.at[varcounter, 'matching_se']
-            df.at[obscounter, 'ols_pval'] = 2 * t.sf(abs(df.at[varcounter, 'matching_coeff'] / df.at[varcounter, 'matching_se']), 105)
-        
-        varcounter += 1
-        obscounter += 2
-
-    # Note: Replace the 105 in the stats.t.sf function with the appropriate degrees of freedom for your t-test
-
-    # List of variables to process
-    varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
-
-    # Generate year and school_id dummies
-    year_dummies = pd.get_dummies(df['year'], prefix='year')
-    school_id_dummies = pd.get_dummies(df['school_id'], prefix='school_id')
-    df = pd.concat([df, year_dummies, school_id_dummies], axis=1)
-
-    # Create residualized dependent variables
-    for varname in varlist:
-        # Creating a lagged variable
-        df[f'lag2_{varname}'] = df[varname].shift(2)  # Adjust the lag as necessary
-
-        # Difference between variable and its lag
-        df[f'r{varname}_temp'] = df[varname] - df[f'lag2_{varname}']
-
-        # Regression
-        formula = f'r{varname}_temp ~ {" + ".join(year_dummies.columns)} + {" + ".join(school_id_dummies.columns)} - 1' # No intercept
-        y, X = dmatrices(formula, data=df, return_type='dataframe')
-        model = sm.OLS(y, X)
-        results = model.fit()
-
-        # Predicting residuals and storing them
-        df[f'r{varname}'] = results.resid
-
-        # Clean up: drop temporary variables
-        df.drop(columns=[f'r{varname}_temp', f'lag2_{varname}'], inplace=True)
-
-    # Note: This code assumes that 'year' and 'school_id' are present in your DataFrame.
-    # Also, ensure that the 'year' and 'school_id' columns are correctly formatted for dummy variable creation.
-
-    # Assuming 'df' is your pandas DataFrame
-    varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
-
-    # Creating the new columns
-    for var in ['matching_resid_coeff', 'matching_resid_se', 'matching_resid_N', 'matching_rf_resid_coeff', 'matching_rf_resid_se']:
-        df[var] = pd.NA  # Initialize with NA values
-
-    for w in range(1, 13):
-        for varname in varlist:
-            # Interaction term generation
-            dummies = pd.get_dummies(df[f'lag_pscore_wk{w}_group'], prefix=f'lag_pscore_wk{w}_group')
-            interaction1 = dummies.mul(df[f'lag_win_wk{w}'], axis=0)
-            interaction2 = dummies.mul(df[f'lag_pscore_wk{w}'], axis=0)
-            df = pd.concat([df, interaction1, interaction2], axis=1)
-
-            # Regression
-            formula = f'r{varname} ~ 0 + _Ilag*'  # Replace '0 + _Ilag*' with actual interaction terms
-            y, X = dmatrices(formula, data=df, return_type='dataframe')
-            model = sm.OLS(y, X)
-            results = model.fit()
-
-            # Store regression statistics
-            df.at[i, 'matching_resid_coeff'] = results.params[0]
-            df.at[i, 'matching_resid_se'] = results.bse[0]
-            df.at[i, 'matching_resid_N'] = len(results.model.endog)
-
-            # Frequency distribution
-            # Similar logic as in previous translations
-            freq_dist = df[f'lag_pscore_wk{w}_group'][results.model.data.row_labels].value_counts()
-            # Process and use the freq_dist as required
-
-            group_var = f'lag_pscore_wk{w}_group'
-
-            # Calculate frequency for each group
-            freq = df[group_var].value_counts().get(j, 0)
-            
-            # Optional: Apply weights if necessary# Assuming 'df' is your pandas DataFrame
-            for w in range(1, 13):
-                # This is where the frequency distribution logic will go for each week
-
-                # Initialize a dictionary to store frequencies for each group
-                freq_dict = {}
-
-                # Iterate through each group and calculate frequencies
+        # Summarizing weights, frequencies, and coefficients
+        for w in range(1, 13):
+            # Assume coefficients are stored in df as coeff_{w}_lag_win_pscore_interaction_wk{w}
+            df['weighted_coeff'] = 0
+            total_weighted_freq = df[f'freq_{w}'].sum()
+            if total_weighted_freq > 0:
                 for j in range(1, 13):
-                    group_var = f'lag_pscore_wk{w}_group'
+                    coeff_column = f'lag_win_pscore_interaction_wk{w}'
+                    df['weighted_coeff'] += df[coeff_column] * df[f'freq_{w}']
 
-                    # Calculate frequency for each group
-                    freq = df[group_var].value_counts().get(j, 0)
-                    
-                    # Optional: Apply weights if necessary
-                    # Assuming weight is a column like 'weight_j'. Adjust as per your data structure.
-                    weight = df[f'weight_{j}'].iloc[0] if f'weight_{j}' in df.columns else 1
-
-                    # Storing weighted frequency
-                    freq_dict[j] = freq * weight
-                    # Assuming weight is a column like 'weight_j'. Adjust as per your data structure.
-                    weight = df[f'weight_{j}'].iloc[0] if f'weight_{j}' in df.columns else 1
-
-                    # Storing weighted frequency
-                    freq_dict[j] = freq * weight
-    # Drop interaction terms to prepare for next iteration
-            df.drop(interaction1.columns.tolist() + interaction2.columns.tolist(), axis=1, inplace=True)
-
-            i += 1# Assuming 'df' is your pandas DataFrame
-
-    for w in range(1, 13):
-        # Add a column for weights for each week
-        df[f'weight_{w}'] = 1  # Initialize all weights as 1
-
-        for j in range(1, 13):
-            # Count wins and losses for each group
-            win_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 1)].shape[0]
-            loss_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 0)].shape[0]
-
-            # Enforce overlap condition
-            if min(win_count, loss_count) < 2:
-                df.loc[df[f'lag_pscore_wk{w}_group'] == j, f'weight_{w}'] = 0
-
-    for w in range(1, 13):
-        # Calculate total weighted frequency
-        totalestobs = sum(df[f'freq{j}'] * df[f'weight{j}'] for j in range(1, 13))
-
-        # Calculate weighted average of coefficients
-        C = sum(df[f'coefficients_{j}'] * df[f'freq{j}'] * df[f'weight{j}'] for j in range(1, 13)) / totalestobs
-        SE = sum(df[f'standard_errors_{j}'] * df[f'freq{j}'] * df[f'weight{j}'] for j in range(1, 13)) / totalestobs
-
-        # Store these values
-        df.at[i, f'matching_rf_resid_coeff_{w}'] = C
-        df.at[i, f'matching_rf_resid_se_{w}'] = SE
-        df.at[i, f'matching_resid_N_{w}'] = totalestobs  # Assuming totalestobs represents the number of observations
-
-        # Adjust the coefficients and standard errors
-        for j in range(1, 13):
-            fs_j = 1 + df.at[i, f'matching_fs_coeff_{w}_{j}']
-            fs_se_j = df.at[i, f'matching_fs_se_{w}_{j}']
-
-            # Adjust coefficients and SE here as needed
-
-        i += 1  # Increment i for the next iteration
+                df[f'weighted_average_coeff_{w}'] = df['weighted_coeff'] / total_weighted_freq
 
         for w in range(1, 13):
-        # Calculate total estimated observations (totalestobs)
-            totalestobs = sum(df[f'freq{j}'] * df[f'weight{j}'] for j in range(1, 13))
+            # Initialize a column to store weights for each group
+            df[f'weight_{w}'] = 1  # Assume all weights are 1 initially
 
-            # Calculating the weighted sum of coefficients (C)
-            C = sum(df[f'_b_IlagXlag__{j}'] * df[f'freq{j}'] * df[f'weight{j}'] / df[f'fs{j}'] for j in range(1, 13)) / totalestobs
+            # Iterate through each of the 12 groups
+            for j in range(1, 13):
+                # Calculate the count of wins and losses in each group
+                win_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 1)].shape[0]
+                loss_count = df[(df[f'lag_pscore_wk{w}_group'] == j) & (df[f'lag_win_wk{w}'] == 0)].shape[0]
 
-            # Calculating the composite standard error (SE)
-            SE_squared_sum = sum(((df[f'_se_IlagXlag__{j}'] / df[f'fs{j}']) ** 2 + (df[f'fs_se{j}'] * df[f'_b_IlagXlag__{j}'] / df[f'fs{j}'] ** 2) ** 2) * (df[f'freq{j}'] * df[f'weight{j}'] / totalestobs) ** 2 for j in range(1, 13))
-            SE = np.sqrt(SE_squared_sum)
+                # Enforce overlap condition
+                if min(win_count, loss_count) < 2:
+                    df.loc[df[f'lag_pscore_wk{w}_group'] == j, f'weight_{w}'] = 0
+        return df
+    
+    df = calculate_weights_and_frequencies(df)
+    print(df.isna().sum()) 
 
-            # Store the calculated C and SE
-            i = ...  # Set 'i' to the appropriate index
-            df.at[i, f'matching_resid_coeff_{w}'] = C
-            df.at[i, f'matching_resid_se_{w}'] = SE
+    #line 39
 
-            i += 1  # Increment i for the next iteration
+    def update_regression_outputs(df):
+        for w in range(1, 13):  # Assuming 'w' varies from 1 to 12
+            coeff_column_name = f'matching_rf_coeff_{w}'
+            if coeff_column_name not in df.columns:
+                raise ValueError(f"The expected column {coeff_column_name} does not exist in the DataFrame.")
+        for w in range(1, 13):
+            df[f'matching_rf_coeff_{w}'] = df[f'matching_rf_coeff_{w}'].fillna(0)  # or other appropriate value
+            df[f'matching_rf_se_{w}'] = df[f'matching_rf_se_{w}'].fillna(0)  # or other appropriate value
+            df[f'matching_N_{w}'] = df[f'matching_N_{w}'].fillna(0)  # Handling NaN in N columns
 
-    # Note: Replace '_b_IlagXlag__{j}', '_se_IlagXlag__{j}', 'fs{j}', and 'fs_se{j}' with the actual names of your DataFrame columns
-    # that contain these values. Ensure that 'fs{j}' and 'fs_se{j}' are already calculated and available in your DataFrame.
 
-    # Calculating total number of observations across all groups
-    df['total_resid_N'] = df[[f'matching_resid_N_{i}' for i in range(1, 13)]].sum(axis=1)
+            # Calculating adjustment factors for standard errors and coefficients
+            # Assumes 'fs' values are somehow calculated and stored previously. Needs manual setup or function.
+            for w in range(1, 13):
+                df[f'fs_{w}'] = 1 + df[f'matching_rf_coeff_{w}']
+                df[f'fs_se_{w}'] = df[f'matching_rf_se_{w}']
 
-    # Calculating weighted averages for coefficients and standard errors
-    df['matching_rf_resid_coeff'] = sum(df[f'matching_rf_resid_coeff_{i}'] * (df[f'matching_resid_N_{i}'] / df['total_resid_N']) for i in range(1, 13))
-    df['matching_rf_resid_se'] = np.sqrt(sum((df[f'matching_rf_resid_se_{i}'] ** 2) * ((df[f'matching_resid_N_{i}'] / df['total_resid_N']) ** 2) for i in range(1, 13)))
+            # Calculate total estimated observations using weighted frequencies and adjustment factors
+            df['totalestobs'] = sum(df[f'freq_{i}'] * df[f'weight_{i}'] / df[f'fs_{i}'] for i in range(1, 13))
 
-    df['matching_resid_coeff'] = sum(df[f'matching_resid_coeff_{i}'] * (df[f'matching_resid_N_{i}'] / df['total_resid_N']) for i in range(1, 13))
-    df['matching_resid_se'] = np.sqrt(sum((df[f'matching_resid_se_{i}'] ** 2) * ((df[f'matching_resid_N_{i}'] / df['total_resid_N']) ** 2) for i in range(1, 13)))
+            # Using the lincom-like method to compute new coefficients and standard errors for each 'w'
+            for w in range(1, 13):
+                df[f'weighted_coeff_{w}'] = sum(df[f'matching_rf_coeff_{w}'] * df[f'freq_{i}'] * df[f'weight_{i}'] / df[f'fs_{i}'] for i in range(1, 13)) / df['totalestobs']
+                df[f'weighted_se_{w}'] = np.sqrt(sum(((df[f'matching_rf_se_{w}'] / df[f'fs_{i}']) ** 2 + (df[f'fs_se_{i}'] * df[f'matching_rf_coeff_{w}'] / df[f'fs_{i}'] ** 2) ** 2) * (df[f'freq_{i}'] * df[f'weight_{i}'] / df['totalestobs']) ** 2 for i in range(1, 13)))
+
+            # Update the DataFrame with the new calculated values
+            df['matching_coeff'] = df[[f'weighted_coeff_{w}' for w in range(1, 13)]].mean(axis=1)
+            df['matching_se'] = df[[f'weighted_se_{w}' for w in range(1, 13)]].mean(axis=1)
+
+        return df
+
+    df = update_regression_outputs(df)
+
+     #Note: Replace the 105 in the stats.t.sf function with the appropriate degrees of freedom for your t-test
+    max_rows = 20  # maximum number of rows to process, this should be less than or equal to the length of the DataFrame
+    degree_freedom = 105  # degrees of freedom for the t-distribution
+
+    # Ensure that the index is correct and the DataFrame has enough rows
+    max_rows = min(max_rows, len(df))
+
+    for i in range(max_rows):
+        # Ensure all variables are present in the DataFrame to avoid KeyError
+        if 'matching_dep_var' in df.columns and f'matching_N_{i+1}' in df.columns:
+            df.at[i, 'variable_name'] = df.at[i, 'matching_dep_var']
+            df.at[i, 'ols_N'] = df.at[i, f'matching_N_{i+1}']
+
+            # Check if the necessary coefficients and errors are available and not zero to avoid division by zero
+            if f'matching_rf_coeff_{i+1}' in df.columns and f'matching_rf_se_{i+1}' in df.columns and df.at[i, f'matching_rf_se_{i+1}'] != 0:
+                result = df.at[i, f'matching_rf_coeff_{i+1}']
+                se = df.at[i, f'matching_rf_se_{i+1}']
+                df.at[i, 'ols_result'] = result
+                df.at[i, 'ols_pval'] = 2 * t.sf(np.abs(result / se), degree_freedom)
+
+            # Fall back to different coefficients if the primary ones are not valid
+            elif f'matching_coeff_{i+1}' in df.columns and f'matching_se_{i+1}' in df.columns and df.at[i, f'matching_se_{i+1}'] != 0:
+                result = df.at[i, f'matching_coeff_{i+1}']
+                se = df.at[i, f'matching_se_{i+1}']
+                df.at[i, 'ols_result'] = result
+                df.at[i, 'ols_pval'] = 2 * t.sf(np.abs(result / se), degree_freedom)
+
+    year_dummies = pd.get_dummies(df['year'], prefix='year')
+    school_id_dummies = pd.get_dummies(df['school_id'], prefix='school_id')
+    year_dummies.columns = year_dummies.columns.str.replace('.', '_')
+    school_id_dummies.columns = school_id_dummies.columns.str.replace('.', '_')
+
+    # Concatenate the DataFrames only once
+    df = pd.concat([df, year_dummies, school_id_dummies], axis=1)
+
+    # List of variables for transformation
+    varlist = [
+        'alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving',
+        'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants',
+        'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25'
+    ]
+
+    # Iterate over each variable in the list
+    for varname in varlist:
+        if f'r{varname}' in df.columns:
+            df.drop(columns=[f'r{varname}'], inplace=True)
+
+        # Create a new temporary variable as the difference between the variable and its lag by 2
+        df[f'lag2_{varname}'] = df[varname].shift(2)
+        df[f'{varname}_temp'] = df[varname] - df[f'lag2_{varname}']
+
+        # Regression on the entire dataset since no specific filtering condition is required
+        model = smf.ols(f'{varname}_temp ~ {" + ".join(year_dummies.columns)}', data=df).fit()
+
+        # Store residuals in a new column
+        df[f'r{varname}'] = model.resid
+        # Drop the temporary difference variable
+        df.drop(columns=[f'{varname}_temp', f'lag2_{varname}'], inplace=True)
+
+    columns_to_drop = [
+        'total_resid_N', 
+        'mmatching_coeff', 
+        'matching_rf_se', 
+        'matching_resid_N', 
+        'matching_rf_coeff_'
+    ]
+
+    # Drop the columns and update the DataFrame in place
+    df.drop(columns=columns_to_drop, inplace=True, errors='ignore')
+    df['total_resid_N'] = df[[f'matching_N_{i}' for i in range(1, 13)]].sum(axis=1)
+
+    # Weighted average of matching_rf_coeff_
+    df['matching_rf_coeff_'] = sum(
+        df[f'matching_rf_coeff_{i}'] * (df[f'matching_N_{i}'] / df['total_resid_N'])
+        for i in range(1, 13)
+    )
+
+    # Weighted root mean square of matching_rf_se
+    df['matching_rf_se'] = np.sqrt(
+        sum((df[f'matching_rf_se_{i}']**2) * ((df[f'matching_N_{i}'] / df['total_resid_N'])**2)
+        for i in range(1, 13))
+    )
+
+    # Weighted average of mmatching_coeff
+    df['matching_coeff'] = sum(
+        df[f'matching_coeff_{i}'] * (df[f'matching_N_{i}'] / df['total_resid_N'])
+        for i in range(1, 13)
+    )
+
+    # Weighted root mean square of matching_rf_se
+    df['matching_rf_se'] = np.sqrt(
+        sum((df[f'matching_rf_se_{i}']**2) * ((df[f'matching_N_{i}'] / df['total_resid_N'])**2)
+        for i in range(1, 13))
+    )
+
+    # Max of N for each matching group
+    df['matching_N_'] = df[[f'matching_N_{i}' for i in range(1, 13)]].max(axis=1)
+
+    # Generating new columns for coefficients, standard errors, and counts
+    for w in range(1, 13):
+        # Assuming lag_pscore_wk and lag_win_wk variables exist
+        # Generating interaction terms as needed (example placeholder)
+        for var in ['lag_win_wk', 'lag_pscore_wk']:
+            df[f'{var}{w}_interaction'] = df[f'lag_pscore_wk{w}_group'] * df[f'{var}{w}']
+
+        varlist = [
+            'alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving',
+            'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants',
+            'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25'
+        ]
+
+    # Initialize an empty list to collect DataFrame rows
+    results_list = []
+    for w in range(1, 13):
+        for varname in varlist:
+            # Create interaction terms explicitly
+            df[f'lag_win_wk{w}_interaction'] = df[f'lag_pscore_wk{w}_group'] * df[f'lag_win_wk{w}']
+            df[f'lag_pscore_wk{w}_interaction'] = df[f'lag_pscore_wk{w}_group'] * df[f'lag_pscore_wk{w}']
+
+            # Define the regression formula using created interaction terms
+            formula = f'{varname} ~ lag_win_wk{w}_interaction + lag_pscore_wk{w}_interaction - 1'
+            model = smf.ols(formula, data=df).fit()
+            
+            # Storing residuals
+            df[f'r{varname}'] = model.resid
+            df['sample_indicator'] = ~model.resid.isnull()  # Rows used in the model
+
+            # Store coefficients and standard errors in the DataFrame
+            for interaction in ['lag_win_wk', 'lag_pscore_wk']:
+                interaction_term = f'{interaction}{w}_interaction'
+                se_column = f'se_{interaction_term}'
+                if interaction_term in model.params.index:
+                    df[se_column] = model.bse[interaction_term]
+                else:
+                    df[se_column] = np.nan
+
+            # Dictionary for storing results with week and variable name
+            results_row = {
+                'Variable': varname,
+                'Week': w,
+                'Coefficient': model.params.get(f'lag_win_wk{w}_interaction', np.nan),
+                'SE': df[f'se_lag_win_wk{w}_interaction'].iloc[0],  # Get SE from the DataFrame
+                'N': model.nobs
+            }
+
+            # Calculate frequencies and check if they are over a threshold
+            freq_table = df[f'lag_pscore_wk{w}_group'].value_counts().sort_index()
+            for j in range(1, 13):
+                freq_column_name = f'freq_w{w}_g{j}'
+                results_row[freq_column_name] = freq_table.get(j, 0) if freq_table.get(j, 0) > 3 else 0
+
+            # Append this dictionary to the results list
+            results_list.append(results_row)
+
+
+    # Cleanup temporary interaction columns
+    for w in range(1, 13):  # Loop through weeks 1 to 12
+        for j in range(1, 13):  # Looping from 1 to 12 for groups
+            wincount = df[(df['sample_indicator']) &
+                        (df[f'lag_pscore_wk{w}_group'] == j) &
+                        (df[f'lag_win_wk{w}'] == 1)].shape[0]
+            losscount = df[(df['sample_indicator']) &
+                        (df[f'lag_pscore_wk{w}_group'] == j) &
+                        (df[f'lag_win_wk{w}'] == 0)].shape[0]
+
+            weight_key = f'weight{w}_g{j}'
+            df[weight_key] = 0 if min(wincount, losscount) < 2 else 1
+
+    
+    def compute_weighted_values(df):
+        # Assuming there are 12 weeks and 12 groups
+        num_weeks = 12
+        num_groups = 12
+        
+        # Calculate total estimated observations and weighted coefficients for each week
+        for w in range(1, num_weeks + 1):
+            # Initialize total estimated observations and weighted coefficient to zero
+            df[f'totalestobs_week{w}'] = 0
+            df[f'weighted_coeff_week{w}'] = 0
+            
+            # Sum across all groups for the week
+            for g in range(1, num_groups + 1):
+                freq_column = f'freq_{w}_{g}'
+                weight_column = f'weight{w}_g{g}'
+                coeff_column = f'coeff_{w}_g{g}'  # Assuming coefficients per group per week
+                
+                # Check if columns exist in DataFrame
+                if freq_column in df.columns and weight_column in df.columns:
+                    # Calculate total estimated observations
+                    df[f'totalestobs_week{w}'] += df[freq_column] * df[weight_column]
+                    
+                    # Assuming there's a coefficient column like coeff_1_g1
+                    if coeff_column in df.columns:
+                        df[f'weighted_coeff_week{w}'] += df[coeff_column] * df[freq_column] * df[weight_column]
+            
+            # Compute the weighted average coefficient if total estimated observations are not zero
+            mask = df[f'totalestobs_week{w}'] > 0
+            df.loc[mask, f'weighted_average_coeff_{w}'] = df.loc[mask, f'weighted_coeff_week{w}'] / df.loc[mask, f'totalestobs_week{w}']
+
+        return df
+
+    # Assuming 'df' is your pandas DataFrame and it's already defined with necessary columns
+    df = compute_weighted_values(df)
+    
+
+    for w in range(1, 13):
+        for j in range(1, 13):
+            # Assuming the existence of interaction terms like 'lag_pscore_wk1_group_1' in df
+            group_var = f'lag_pscore_wk{w}_group_{j}'
+            if group_var in df.columns:
+                variance = df[group_var].var()
+                df[f'fs{w}_g{j}'] = 1 / variance if variance != 0 else 0
+            else:
+                df[f'fs{w}_g{j}'] = np.nan
+
+    for w in range(1, 13):
+        # Calculate total estimated observations (totalestobs) only up to 11, ensuring it is summed into a single scalar value
+        totalestobs = sum((df[f'freq_{w}_{j}'] * df[f'weight{w}_g{j}']).sum() for j in range(1, 12))
+
+        # Calculating the weighted sum of coefficients (C) if totalestobs is not zero
+        if totalestobs != 0:
+            C = sum((df[f'lag_win_wk{j}_interaction'] * df[f'freq_{w}_{j}'] * df[f'weight{w}_g{j}'] / df[f'fs{w}_g{j}']).sum() for j in range(1, 12)) / totalestobs
+        else:
+            C = np.nan
+
+        # Calculating the composite standard error (SE)
+        SE_squared_sum = sum(
+            (
+                (df[f'se_lag_win_wk{j}_interaction'] / df[f'fs{w}_g{j}']) ** 2 +
+                (df[f'matching_fs_se_{w}_{j}'] * df[f'lag_win_wk{j}_interaction'] / df[f'fs{w}_g{j}'] ** 2) ** 2
+            ) * 
+            (df[f'freq_{w}_{j}'] * df[f'weight{w}_g{j}'] / totalestobs) ** 2
+            for j in range(1, 12)
+        ).sum()
+        SE = np.sqrt(SE_squared_sum)
+
+        # Ensure the index is correct and within the bounds of the DataFrame
+        index_to_update = w - 1
+        if 0 <= index_to_update < len(df):
+            df.at[index_to_update, f'matching_rf_coeff_{w}'] = C
+            df.at[index_to_update, f'matching_rf_se_{w}'] = SE
+            df.at[index_to_update, f'matching_N_{w}'] = totalestobs
+        else:
+            print(f"Index {index_to_update} out of bounds for DataFrame with length {len(df)}.")
+            
+    # Sort the DataFrame by teamname and year to ensure the lag is calculated correctly
+    df.sort_values(['teamname', 'year'], inplace=True)
+
+    # Create lagged variables
+    for varname in varlist:
+        for i in range(1, 5):  # Create lags from 1 to 4 years
+            df[f'lag{i}_{varname}'] = df.groupby('teamname')[varname].shift(i)
+            # Ensure that the year difference is exactly i years
+            df[f'lag{i}_{varname}'] = df.apply(
+                lambda row: row[f'lag{i}_{varname}'] if row['year'] == (row['year'] - i + i) else None, axis=1
+            )
+    # Note: Replace '_b_lagXlag_{j}', '_se_lagXlag_{j}', 'fs{j}', and 'fs_se{j}' with the actual names of your DataFrame columns
+    # that contain these values. Ensure that 'fs_{j}' and 'fs_se_{j}' are already calculated and available in your DataFrame.
+
+    # Ensure total_resid_N is not zero to avoid division by zero
+    df['total_resid_N'] = df[[f'matching_N_{i}' for i in range(1, 13)]].sum(axis=1)
+    df.loc[df['total_resid_N'] == 0, 'total_resid_N'] = np.nan  # Replace zero with NaN to avoid division by zero
+
+    # Calculating weighted averages for coefficients and standard errors using proper element-wise multiplication and sum
+    df['matching_rf_coeff_'] = np.sum([df[f'matching_rf_coeff_{i}'] * (df[f'matching_N_{i}'] / df['total_resid_N']) for i in range(1, 13)], axis=0)
+    df['matching_rf_se'] = np.sqrt(np.sum([(df[f'matching_rf_se_{i}'] ** 2) * ((df[f'matching_N_{i}'] / df['total_resid_N']) ** 2) for i in range(1, 13)], axis=0))
+
+    df['mmatching_coeff'] = np.sum([df[f'matching_coeff_{i}'] * (df[f'matching_N_{i}'] / df['total_resid_N']) for i in range(1, 13)], axis=0)
+    df['matching_rf_se'] = np.sqrt(np.sum([(df[f'matching_rf_se_{i}'] ** 2) * ((df[f'matching_N_{i}'] / df['total_resid_N']) ** 2) for i in range(1, 13)], axis=0))
 
     # The maximum number of observations among all groups
-    df['matching_resid_N'] = df[[f'matching_resid_N_{i}' for i in range(1, 13)]].max(axis=1)
+    df['matching_N_'] = df[[f'matching_N_{i}' for i in range(1, 13)]].max(axis=1)
 
-    # Initialize new variables
-    for var in ['ols_result_seq', 'ols_result_wgt_seq', 'ols_pval_seq', 'ols_N_seq', 'ldv_result_seq', 'ldv_result_wgt_seq', 'ldv_pval_seq', 'ldv_N_seq', 'ldv_se_wgt_seq']:
-        df[var] = np.nan
+    # Safety checks for obscounter and varcounter within DataFrame index range
+    max_rows = min(20, len(df) - 1)  # Ensures we do not exceed DataFrame index
 
-    obscounter = 0
-    varcounter = 0
-
-    while obscounter < 20:
+    # Updating DataFrame values safely
+    for obscounter in range(0, max_rows, 2):
+        varcounter = obscounter // 2  # Mapping obscounter to varcounter safely
         secounter = obscounter + 1
 
-        # Updating the DataFrame
-        df.at[obscounter, 'ldv_N'] = df.at[varcounter, 'matching_resid_N']
-        
-        if 3 == 0:  # Replace 3 with your actual condition
-            df.at[obscounter, 'ldv_result'] = df.at[varcounter, 'matching_rf_resid_coeff']
-            df.at[secounter, 'ldv_result'] = df.at[varcounter, 'matching_rf_resid_se']
-            df.at[obscounter, 'ldv_pval'] = 2 * t.sf(abs(df.at[varcounter, 'matching_rf_resid_coeff'] / df.at[varcounter, 'matching_rf_resid_se']), 105)
-        else:
-            df.at[obscounter, 'ldv_result'] = df.at[varcounter, 'matching_resid_coeff']
-            df.at[secounter, 'ldv_result'] = df.at[varcounter, 'matching_resid_se']
-            df.at[obscounter, 'ldv_pval'] = 2 * t.sf(abs(df.at[varcounter, 'matching_resid_coeff'] / df.at[varcounter, 'matching_resid_se']), 105)
-        
-        varcounter += 1
-        obscounter += 2
+        # Ensure secounter is within bounds
+        if secounter < len(df):
+            df.at[obscounter, 'ldv_result'] = df.at[varcounter, 'mmatching_coeff']
+            df.at[secounter, 'ldv_result'] = df.at[varcounter, 'matching_rf_se']
+            df.at[obscounter, 'ldv_pval'] = 2 * t.sf(abs(df.at[varcounter, 'mmatching_coeff'] / df.at[varcounter, 'matching_rf_se']), 105)
 
-    # Drop unused interaction terms if they exist in your DataFrame
-    # df.drop(columns=[col for col in df.columns if col.startswith('_I')], errors='ignore', inplace=True)
+        # # Note: Replace the 105 in the stats.t.sf function with the appropriate degrees of freedom for your t-test
+        # Adjust the indices, variable names, and conditional logic as per your specific requirements.
 
-    # Note: Replace the 105 in the stats.t.sf function with the appropriate degrees of freedom for your t-test
-    # Adjust the indices, variable names, and conditional logic as per your specific requirements.
+        # Assuming 'df' is your pandas DataFrame
+        df['rseasonwins'] = df['lag_seasonwins'] - df['lag3_seasonwins']
+        df['rseasongames'] = df['lag_seasongames'] - df['lag3_seasongames']
 
-    # Assuming 'df' is your pandas DataFrame
-    df['rseasonwins'] = df['lag_seasonwins'] - df['lag3_seasonwins']
-    df['rseasongames'] = df['lag_seasongames'] - df['lag3_seasongames']
 
     varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
-    counter = 0
+    counter = 1
+    results_df = pd.DataFrame()
 
     for varname in varlist:
-        # Creating difference variables
+        # Generate difference variables
+        df[f'r{varname}'] = df[varname] - df[f'lag2_{varname}']
+        # Check for any missing values in key variables and handle them
+        # Here's just an example of handling missing data. Modify as per your dataset's requirements.
+        important_columns = ['rseasonwins', 'lag3_seasonwins', 'lag_seasongames', 'lag3_seasongames', 'year', 'lag_ipw_weight', 'ralumni_ops_athletics', 'school_id']
+        df.dropna(subset=important_columns, inplace=True)
+
+        # Weighted Least Squares (WLS) Regression
+        formula_wls = f"r{varname} ~ rseasonwins + lag3_seasonwins + lag_seasongames + lag3_seasongames + year"
+    try:
+            wls_model = smf.wls(formula_wls, data=df, weights=df['lag_ipw_weight']).fit()
+            print("WLS Model Summary:")
+            print(wls_model.summary())
+    except Exception as e:
+        print(f"Failed to fit WLS model for {varname}:", str(e))
+
+
+    for varname in varlist:
+        # Generate difference variables
         df[f'r{varname}'] = df[varname] - df[f'lag2_{varname}']
 
-        # Regression with clustered standard errors
-        formula = f'r{varname} ~ rseasonwins + lag3_seasonwins + lag_seasongames + lag3_seasongames + C(year)' # Adjust the formula as necessary
-        model = smf.ols(formula, data=df, weights=df['lag_ipw_weight']) # Adjust weights and subset conditions as necessary
-        results = model.fit(cov_type='cluster', cov_kwds={'groups': df['school_id']})
+        # Drop any missing values in key variables
+        important_columns = ['rseasonwins', 'lag3_seasonwins', 'lag_seasongames', 'lag3_seasongames', 'year', 'lag_ipw_weight', f'r{varname}', 'school_id']
+        df.dropna(subset=important_columns, inplace=True)
 
-        # Updating variables based on regression results
-        df.at[counter, 'ldv_result_seq'] = results.params['rseasonwins']
-        df.at[counter, 'ldv_pval_seq'] = 2 * t.sf(np.abs(results.params['rseasonwins'] / results.bse['rseasonwins']), results.df_resid) # df_resid is degrees of freedom
-        df.at[counter, 'ldv_N_seq'] = results.nobs
-        counter += 1
+        # Fit the Weighted Least Squares (WLS) Regression
+        formula_wls = f"r{varname} ~ rseasonwins + lag3_seasonwins + lag_seasongames + lag3_seasongames + year"
+        try:
+            wls_model = smf.wls(formula=formula_wls, data=df, weights=df['lag_ipw_weight']).fit()
+            print(f"WLS Model Summary for {varname}:")
+            print(wls_model.summary())
 
-        df.at[counter, 'ldv_result_seq'] = results.bse['rseasonwins']
-        counter += 1
+            # Store results
+            results_df.loc[counter, 'Variable'] = varname
+            results_df.loc[counter, 'Coefficient'] = wls_model.params['rseasonwins']
+            results_df.loc[counter, 'P-value'] = 2 * t.sf(abs(wls_model.params['rseasonwins'] / wls_model.bse['rseasonwins']), wls_model.df_resid)
+            results_df.loc[counter, 'N'] = wls_model.nobs
+            counter += 1
+            
+            # Store residuals with handling for failed model fits
+            df[f'{varname}_resid'] = wls_model.resid if 'resid' in dir(wls_model) else pd.NA
+        except Exception as e:
+            print(f"Failed to fit WLS model for {varname}:", str(e))
+
+        for varname in varlist:
+            resid_varname = f'{varname}_resid'
+            if resid_varname in df.columns:
+                if varname in ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving']:
+                    # Placeholder for transformation - actual division not performed here
+                    df[f'label_{resid_varname}'] = "Millions of dollars"
+                elif varname in ['vse_alum_giving_rate', 'acceptance_rate']:
+                    # Placeholder for transformation - actual percentage conversion not performed here
+                    df[f'label_{resid_varname}'] = "Percentage"
+                elif varname in ['usnews_academic_rep_new', 'sat_25']:
+                    df[f'label_{resid_varname}'] = "Points"
+                elif varname in ['applicants', 'firsttime_outofstate', 'first_time_instate']:
+                    df[f'label_{resid_varname}'] = "Students"
+            
+
+        # # Preparing data for OLS with clustered standard errors
+        # # Ensure 'year' is a category and create dummies
+        # df['year'] = df['year'].astype('category')  # Even if converted before, confirming type here
+        # X = df[['rseasonwins', 'lag3_seasonwins', 'lag_seasongames', 'lag3_seasongames']]
+        # X = pd.get_dummies(X.join(df['year'].astype(str)), drop_first=True)  # Using .astype(str) ensures categorical treatment
+        # X = sm.add_constant(X)  # Add a constant for the intercept
+        # print(X.isnull().sum())
+        # # Handling NaNs if necessary
+        # X.fillna(X.mean(), inplace=True)
+        # y = df['ralumni_ops_athletics']
+
+        # try:
+        #     model = sm.OLS(y, X.astype(float))  # Ensuring all data passed to OLS are floats
+        #     results = model.fit(cov_type='cluster', cov_kwds={'groups': df['school_id'].astype('category')})  # Ensure groups are categorical
+        #     print("\nOLS with Clustered Standard Errors Model Summary:")
+        #     print(results.summary())
+        # except Exception as e:
+        #     print("Failed to fit OLS model with clustered SEs:", str(e))
+                
+                # Store results in results_df
+
 
     # Conditional operation
     if 3 == 0:  # Replace 3 with the actual condition
         df.rename(columns={'ldv_pval': 'ldv_pval_rf'}, inplace=True)
+    return df
 
 
 
 # Load your dataset
-df = pd.read_csv('Formatted_data.csv')
-
+pulling_data = pd.read_csv('Formatted_data.csv')
+df = pulling_data
 # Filter parameters
 bcs = df['bcs'] <= 1
 trim_value = df['lag_ipw_weight'].quantile(0.9)
@@ -602,40 +776,84 @@ df = main_results(df, bcs, trim_value, iv_flag, cluster)
 # Define the list of variables for the regression
 var_list = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
 
-# Loop for regression, prediction, and adjustments
-for varname in var_list:
-    # Run regression
-    formula = f'{varname} ~ lag3_seasonwins + lag_seasongames + lag3_seasongames + C(year)'
-    model = smf.ols(formula, data=df.query('lag_ipw_weight < @trim_value and @bcs and lag_seasonwins != "."'))
-    result = model.fit(cov_type='cluster', cov_kwds={'groups': df[cluster]})
+# Assume cluster is set to the column name containing the group identifiers
+cluster = 'school_id'  # make sure this column exists and is correctly named in your DataFrame
 
-    # Store results (example: residuals)
-    df[f'r{varname}_resid'] = result.resid + result.params['Intercept']
+# Checking and cleaning if necessary
+if cluster not in df.columns:
+    print(f"Column {cluster} not found in DataFrame.")
+else:
+    # Check for any NaN values in the cluster column
+    if df[cluster].isna().any():
+        print(f"NaN values found in {cluster} column. Attempting to fill with mode.")
 
-# Define the list of variables
-var_list = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
 
-# Loop through the variables and apply transformations
-for varname in var_list:
-    resid_varname = f'r{varname}_resid'
+    # Additional check for the length and preview before regression
+    print(f"Length of DataFrame: {len(df)}")
+    print(f"Unique groups count: {df[cluster].nunique()}")
+    print("Sample data from DataFrame used for regression:")
+    print(df[['lag_ipw_weight', 'seasonwins', cluster]].head())  # Adjust columns to those relevant for your regression
 
-    # Adjustments based on variable names
+# Update your model fitting code to use the new combined grouping variable
+try:
+    formula = f'seasonwins ~ lag_ipw_weight + C(year)'
+    # Ensure data is filtered appropriately and doesn't include rows with potential NaN issues if that affects your model
+    df_filtered = df.dropna(subset=['lag_ipw_weight', 'seasonwins', 'school_year_group'])
+    model = smf.ols(formula, data=df_filtered)
+    result = model.fit(cov_type='cluster', cov_kwds={'groups': df_filtered['school_year_group']})
+    print(result.summary())
+except Exception as e:
+    print(f"Error in model fitting: {e}")
+
+# Drop rows where any of the key variables are NaN (or handle NaN values according to your methodology)
+df = df.dropna(subset=['lag_ipw_weight', 'seasonwins', 'school_id', 'year'])
+
+# Recreate the combined grouping variable after handling NaNs
+df['school_year_group'] = df['school_id'].astype(str) + '_' + df['year'].astype(str)
+
+# Filter the DataFrame just before fitting the model to ensure all data is aligned
+filtered_df = df.query('lag_ipw_weight < @trim_value and seasonwins != "."')
+
+# Verify the alignment
+print("Filtered DataFrame length:", len(filtered_df))
+print("Unique groups count in filtered data:", filtered_df['school_year_group'].nunique())
+
+try:
+    formula = 'seasonwins ~ lag_ipw_weight + C(year)'
+    model = smf.ols(formula, data=filtered_df)
+    result = model.fit(cov_type='cluster', cov_kwds={'groups': filtered_df['school_year_group']})
+    print(result.summary())
+except Exception as e:
+    print(f"Error in model fitting: {e}")
+
+
+varlist = [
+    'alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving',
+    'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants',
+    'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25', 'seasonwins'
+]
+residuals_df = pd.DataFrame()
+# Loop through the list of variables
+for varname in varlist:
+    # Calculate residuals if not already done
+    df[f'r{varname}_resid'] = df[varname] - df[f'lag2_{varname}']
+    
+
+    # Apply transformations and label assignment based on variable name
     if varname in ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving']:
-        df[resid_varname] = df[resid_varname] / 1000000
-        df[resid_varname].rename("Millions of dollars", inplace=True)
-
+        df[f'r{varname}_resid'] /= 1000000
+        df[f'label_{varname}'] = "Millions of dollars"
     elif varname == 'vse_alum_giving_rate':
-        df[resid_varname].rename("Share", inplace=True)
-
+        df[f'label_{varname}'] = "Share"
     elif varname in ['usnews_academic_rep_new', 'sat_25']:
-        df[resid_varname].rename("Points", inplace=True)
-
+        df[f'label_{varname}'] = "Points"
     elif varname == 'acceptance_rate':
-        df[resid_varname] = df[resid_varname] / 100
-        df[resid_varname].rename("Share", inplace=True)
-
+        df[f'r{varname}_resid'] /= 100
+        df[f'label_{varname}'] = "Percentage"
     elif varname in ['applicants', 'firsttime_outofstate', 'first_time_instate']:
-        df[resid_varname].rename("Students", inplace=True)
+        df[f'label_{varname}'] = "Students"
+
+
 
 labels = {
     'alumni_ops_athletics': "Athletic Operating Donations",
@@ -650,24 +868,29 @@ labels = {
     'sat_25': "25th Percentile SAT Score"
 }
 
-var_list = list(labels.keys())
-
-import seaborn as sns
-import matplotlib.pyplot as plt
+varlist = [
+    'alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving', 
+    'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants', 
+    'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25'
+]
 
 counter = 1
-for varname in var_list:
+
+for varname in varlist:
+    # Assuming rseasonwins_resid is already calculated and exists
+    # Create a lowess plot using seaborn
     plt.figure(figsize=(10, 6))
-    sns.regplot(x=f'r{varname}_resid', y='rseasonwins_resid', data=df, lowess=True, 
-                scatter_kws={'s': 5}, line_kws={'color': 'grey', 'lw': 1})
+    sns.regplot(x=f'r{varname}_resid', y=f'rseasonwins_resid', data=df, lowess=True,
+                scatter_kws={'alpha': 0.5}, line_kws={'color': 'gray', 'lw': 1})
+    
+    plt.xlabel('Change in Wins', fontsize=12)
+    plt.ylabel(labels[varname], fontsize=12)
+    plt.title(f"Panel {counter}: Effect of Wins on {labels[varname]}", fontsize=14)
+    plt.xlim(-6, 6)
+    plt.grid(True, linestyle='--', color='lightgray')
 
-    plt.title(f"Panel {counter}: Effect of Wins on {labels[varname]}", size='large')
-    plt.xlabel("Change in Wins", size='medium')
-    plt.ylabel(labels[varname], size='medium')
-    plt.xticks(rotation=-6, fontsize='medium')
-    plt.yticks(fontsize='medium')
-    plt.legend().set_visible(False)
-
-    plt.savefig(f'gph_{counter}.png', bbox_inches='tight')
+    # Save the plot
+    plt.savefig(f"gph_{counter}.png")
     plt.close()
+
     counter += 1
