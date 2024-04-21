@@ -12,6 +12,7 @@ import warnings
 
 # Suppress only PerformanceWarnings from pandas
 warnings.filterwarnings(action='ignore', category=UserWarning, message='.*DataFrame is highly fragmented.*')
+warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 pd.options.mode.chained_assignment = None
 
 # Load the CSV file into a DataFrame
@@ -670,28 +671,10 @@ def main_results(df, bcs, trim_value, iv_flag, cluster_school):
     for varname in varlist:
         # Generate difference variables
         df[f'r{varname}'] = df[varname] - df[f'lag2_{varname}']
-        # Check for any missing values in key variables and handle them
-        # Here's just an example of handling missing data. Modify as per your dataset's requirements.
-        important_columns = ['rseasonwins', 'lag3_seasonwins', 'lag_seasongames', 'lag3_seasongames', 'year', 'lag_ipw_weight', 'ralumni_ops_athletics', 'school_id']
-        df.dropna(subset=important_columns, inplace=True)
-
-        # Weighted Least Squares (WLS) Regression
-        formula_wls = f"r{varname} ~ rseasonwins + lag3_seasonwins + lag_seasongames + lag3_seasongames + year"
-    try:
-            wls_model = smf.wls(formula_wls, data=df, weights=df['lag_ipw_weight']).fit()
-            print("WLS Model Summary:")
-            print(wls_model.summary())
-    except Exception as e:
-        print(f"Failed to fit WLS model for {varname}:", str(e))
-
-
-    for varname in varlist:
-        # Generate difference variables
-        df[f'r{varname}'] = df[varname] - df[f'lag2_{varname}']
 
         # Drop any missing values in key variables
-        important_columns = ['rseasonwins', 'lag3_seasonwins', 'lag_seasongames', 'lag3_seasongames', 'year', 'lag_ipw_weight', f'r{varname}', 'school_id']
-        df.dropna(subset=important_columns, inplace=True)
+        # important_columns = ['rseasonwins', 'lag3_seasonwins', 'lag_seasongames', 'lag3_seasongames', 'year', 'lag_ipw_weight', f'r{varname}', 'school_id']
+        # df.dropna(subset=important_columns, inplace=True)
 
         # Fit the Weighted Least Squares (WLS) Regression
         formula_wls = f"r{varname} ~ rseasonwins + lag3_seasonwins + lag_seasongames + lag3_seasongames + year"
@@ -875,13 +858,17 @@ varlist = [
 ]
 
 counter = 1
-
 for varname in varlist:
-    # Assuming rseasonwins_resid is already calculated and exists
-    # Create a lowess plot using seaborn
     plt.figure(figsize=(10, 6))
-    sns.regplot(x=f'r{varname}_resid', y=f'rseasonwins_resid', data=df, lowess=True,
-                scatter_kws={'alpha': 0.5}, line_kws={'color': 'gray', 'lw': 1})
+    # Using linear regression instead of LOWESS
+    sns.regplot(
+        x=f'r{varname}_resid', 
+        y=f'rseasonwins_resid', 
+        data=df, 
+        scatter=False,  # No scatter plot
+        line_kws={'color': 'gray', 'lw': 2},  # Line settings
+        ci=95  # Confidence interval set to 95% by default
+    )
     
     plt.xlabel('Change in Wins', fontsize=12)
     plt.ylabel(labels[varname], fontsize=12)
@@ -892,5 +879,6 @@ for varname in varlist:
     # Save the plot
     plt.savefig(f"gph_{counter}.png")
     plt.close()
+    print(f"Graph saved as gph_{counter}.png")
 
     counter += 1
