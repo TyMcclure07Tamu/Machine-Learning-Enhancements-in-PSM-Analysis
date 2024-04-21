@@ -1,0 +1,125 @@
+import pandas as pd
+import statsmodels.formula.api as smf
+from scipy.stats import t
+
+# Example DataFrame initialization (this will depend on your actual data)
+# df = pd.DataFrame({
+#     'bcs': [...], 
+#     'lag_win_wk1': [...], 'lag_pscore_wk1': [...], 
+#     # ... (and so on for all lag_win_wk and lag_pscore_wk)
+# })
+
+# Variable list
+varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving',
+           'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants',
+           'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
+
+# Initialize columns
+df['variable_name'] = ""
+df['ols_result'] = pd.NA
+df['ols_pval'] = pd.NA
+df['ols_N'] = pd.NA
+df['ldv_result'] = pd.NA
+df['ldv_pval'] = pd.NA
+df['ldv_N'] = pd.NA
+
+# Running weighted regressions
+for w in range(1, 13):
+    df[f'weight_{w}'] = df[f'lag_win_wk{w}'] / df[f'lag_pscore_wk{w}'] + (1 - df[f'lag_win_wk{w}']) / (1 - df[f'lag_pscore_wk{w}'])
+    i = 1
+
+    for varname in varlist:
+        # Creating a regression model
+        condition = (df['bcs'] <= 1) & (df[f'lag_pscore_wk{w}'] >= .05) & (df[f'lag_pscore_wk{w}'] <= .95)
+        result = smf.wls(f"{varname} ~ lag_win_wk{w}", data=df[condition], weights=df[f'weight_{w}']).fit()
+
+        # Storing results
+        df.at[i, 'matching_dep_var'] = varname
+        df.at[i, f'matching_coeff_{w}'] = result.params[f'lag_win_wk{w}']
+        df.at[i, f'matching_se_{w}'] = result.bse[f'lag_win_wk{w}']
+        df.at[i, f'matching_N_{w}'] = result.nobs
+
+        i += 1
+
+# Calculating total_N and other metrics
+df['total_N'] = df[[f'matching_N_{i}' for i in range(1, 13)]].sum(axis=1)
+
+# Loop for updating results
+obscounter = 1
+varcounter = 1
+while obscounter <= 20:
+    secounter = obscounter + 1
+    # ... update df with matching_rf_coeff, matching_rf_se calculations ...
+    # ... use df.at[obscounter, 'column_name'] = value_to_assign ...
+    varcounter += 1
+    obscounter += 2
+
+# Creating residualized dependent variables for weighted regressions
+for varname in varlist:
+    # ... perform regression and create residuals ...
+    # ... this will involve statsmodels regression and prediction ...
+
+# Additional steps for the final part of the code
+# This includes further data manipulation and computations as per your requirement
+import pandas as pd
+import statsmodels.formula.api as smf
+from scipy.stats import t
+
+# Example DataFrame initialization (adjust based on your actual data)
+# df = pd.DataFrame({...})
+
+# List of variables for regression
+varlist = ['alumni_ops_athletics', 'alum_non_athl_ops', 'alumni_total_giving',
+           'vse_alum_giving_rate', 'usnews_academic_rep_new', 'applicants',
+           'acceptance_rate', 'firsttime_outofstate', 'first_time_instate', 'sat_25']
+
+# Initialize new columns in df
+for w in range(1, 13):
+    df[f'matching_resid_coeff_{w}'] = pd.NA
+    df[f'matching_resid_se_{w}'] = pd.NA
+    df[f'matching_resid_N_{w}'] = pd.NA
+
+# Run regressions and compute weights
+for w in range(1, 13):
+    df['weight'] = df[f'lag_win_wk{w}'] / df[f'lag_pscore_wk{w}'] + (1 - df[f'lag_win_wk{w}']) / (1 - df[f'lag_pscore_wk{w}'])
+    i = 1
+
+    for varname in varlist:
+        # Define your regression model here
+        # This is an example, adjust the regression formula as per your needs
+        result = smf.wls(f'{varname} ~ lag_win_wk{w}', data=df, weights=df['weight']).fit()
+
+        # Store the results
+        df.at[i, f'matching_resid_coeff_{w}'] = result.params[f'lag_win_wk{w}']
+        df.at[i, f'matching_resid_se_{w}'] = result.bse[f'lag_win_wk{w}']
+        df.at[i, f'matching_resid_N_{w}'] = result.nobs
+        i += 1
+
+# Calculate total_resid_N, matching_resid_rf_coeff, and matching_resid_rf_se
+df['total_resid_N'] = df[[f'matching_resid_N_{i}' for i in range(1, 13)]].sum(axis=1)
+
+for w in range(1, 13):
+    df[f'matching_resid_rf_coeff_{w}'] = df[f'matching_resid_coeff_{w}'] * (df[f'matching_resid_N_{w}'] / df['total_resid_N'])
+    df[f'matching_resid_rf_se_{w}'] = ((df[f'matching_resid_se_{w}'] ** 2) * (df[f'matching_resid_N_{w}'] / df['total_resid_N']) ** 2)
+
+df['matching_resid_rf_coeff'] = df[[f'matching_resid_rf_coeff_{i}' for i in range(1, 13)]].sum(axis=1)
+df['matching_resid_rf_se'] = (df[[f'matching_resid_rf_se_{i}' for i in range(1, 13)]].sum(axis=1)) ** 0.5
+df['matching_resid_N'] = df[[f'matching_resid_N_{i}' for i in range(1, 13)]].max(axis=1)
+
+# Loop for updating ldv_N, ldv_result, and ldv_pval
+obscounter = 1
+varcounter = 1
+while obscounter <= 20:
+    secounter = obscounter + 1
+    df.at[obscounter, 'ldv_N'] = df.at[varcounter, f'matching_resid_N_{varcounter}']
+    df.at[obscounter, 'ldv_result'] = df.at[varcounter, 'matching_resid_rf_coeff']
+    df.at[secounter, 'ldv_result'] = df.at[varcounter, 'matching_resid_rf_se']
+    df.at[obscounter, 'ldv_pval'] = 2 * t.sf(abs(df.at[varcounter, 'matching_resid_rf_coeff'] / df.at[varcounter, 'matching_resid_rf_se']), 105)
+
+    varcounter += 1
+    obscounter += 2
+
+# Dropping interim columns starting with '_I'
+df.drop(columns=[col for col in df.columns if col.startswith('_I')], inplace=True)
+
+# Note: Add additional code for creating residualized dependent variables for weighted regressions
